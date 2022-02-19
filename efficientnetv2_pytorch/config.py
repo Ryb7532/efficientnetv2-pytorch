@@ -6,6 +6,7 @@ base_config = Config(
         # model related params.
         model=dict(
                 model_name='efficientnet_b0',
+                # data_format='channels_last',
                 feature_size=1280,
                 bn_type=None,     # 'gpu_bn',
                 bn_momentum=0.9,
@@ -15,7 +16,7 @@ base_config = Config(
                 min_depth=8,
                 act_fn='silu',
                 survival_prob=0.8,
-                local_pooling=False,
+                # local_pooling=False,
                 headbias=None,
                 conv_dropout=None,
                 dropout_rate=None,
