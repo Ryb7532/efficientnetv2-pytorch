@@ -13,7 +13,8 @@ EfficientNet V1 and V2 model.
     https://arxiv.org/abs/2104.00298
 """
 import copy
-from typing import Optional
+from typing import Optional, List
+from matplotlib import scale
 
 import torch
 import torch.nn as nn
@@ -63,18 +64,16 @@ class SELayer(nn.Module):
     def __init__(self, mconfig, in_channels, se_filters, output_filters):
         super(SELayer, self).__init__()
 
-        self._local_pooling = mconfig.local_pooling
-        self._act = utils.get_act_fn(mconfig.act_fn)(se_filters)
-
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
         # Squeeze and Excitation layer.
-        self._se_reduce = nn.Conv2d(
+        self.fc1 = nn.Conv2d(
             in_channels,
             se_filters,
             kernel_size=1,
             stride=1,
             padding='same',
             bias=True)
-        self._se_expand = nn.Conv2d(
+        self.fc2 = nn.Conv2d(
             se_filters,
             output_filters,
             kernel_size=1,
@@ -82,16 +81,20 @@ class SELayer(nn.Module):
             padding='same',
             bias=True)
 
-        utils.conv_kernel_initialize(self._se_reduce)
-        utils.conv_kernel_initialize(self._se_expand)
+        self.activation = utils.get_act_fn(mconfig.act_fn)(se_filters)
+        self.scale_activation = nn.Sigmoid()
+
+    def _scale(self, inputs):
+        scale = self.avgpool(inputs)
+        scale = self.fc1(scale)
+        scale = self.activation(scale)
+        scale = self.fc2(scale)
+        scale = self.scale_activation(scale)
+        return scale
 
     def forward(self, inputs):
-        if self._local_pooling:
-            se_tensor = F.adaptive_avg_pool2d(inputs, 1)
-        else:
-            se_tensor = torch.mean(inputs, [2, 3], keepdim=True)
-        se_tensor = self._se_expand(self._act(self._se_reduce(se_tensor)))
-        return torch.sigmoid(se_tensor) * inputs
+        scale = self._scale(inputs)
+        return scale * inputs
 
 
 class MBConvBlock(nn.Module):
@@ -108,14 +111,10 @@ class MBConvBlock(nn.Module):
 
         self._block_args = copy.deepcopy(block_args)
         self._mconfig = copy.deepcopy(mconfig)
-        self._local_pooling = mconfig.local_pooling
-        self._channel_axis = 1
 
         self._has_se = (
             self._block_args.se_ratio is not None and
             0 < self._block_args.se_ratio <= 1)
-
-        self.endpoints = None
 
         # Builds the block accordings to arguments.
         self._build()
@@ -128,71 +127,80 @@ class MBConvBlock(nn.Module):
         filters = input_filters * block_args.expand_ratio
         kernel_size = block_args.kernel_size
 
+        layers: List[nn.Module] = []
+
         # Expansion phase. Called if not using fused convolutions and expansion
         # phase is necessary.
         if block_args.expand_ratio != 1:
-            self._expand_conv = nn.Conv2d(
-                input_filters,
-                filters,
-                kernel_size=1,
-                stride=1,
-                padding='same',
-                bias=False)
-            utils.conv_kernel_initialize(self._expand_conv)
-            self._norm0 = utils.normalization(
-                mconfig.bn_type,
-                filters,
-                eps=mconfig.bn_eps,
-                momentum=mconfig.bn_momentum,
-                groups=mconfig.gn_groups)
-
-        self._act = utils.get_act_fn(mconfig.act_fn)(filters)
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        input_filters,
+                        filters,
+                        kernel_size=1,
+                        stride=1,
+                        padding='same',
+                        bias=False),
+                    utils.normalization(
+                        mconfig.bn_type,
+                        filters,
+                        eps=mconfig.bn_eps,
+                        momentum=mconfig.bn_momentum,
+                        groups=mconfig.gn_groups),
+                    utils.get_act_fn(mconfig.act_fn)(filters)
+                )
+            )
 
         # Depth-wise convolution phase. Called if not using fused convolutions.
-        self._depthwise_conv = nn.Conv2d(
-            filters,
-            filters,
-            kernel_size=kernel_size,
-            stride=block_args.strides,
-            padding=kernel_size // 2,
-            groups=filters,
-            bias=False)
-        utils.conv_kernel_initialize(self._depthwise_conv)
+        layers.append(
+            nn.Sequential(
+                nn.Conv2d(
+                    filters,
+                    filters,
+                    kernel_size=kernel_size,
+                    stride=block_args.strides,
+                    padding=kernel_size // 2,
+                    groups=filters,
+                    bias=False),
+                utils.normalization(
+                    mconfig.bn_type,
+                    filters,
+                    eps=mconfig.bn_eps,
+                    momentum=mconfig.bn_momentum,
+                    groups=mconfig.gn_groups),
+                utils.get_act_fn(mconfig.act_fn)(filters)
+            )
+        )
 
-        self._norm1 = utils.normalization(
-            mconfig.bn_type,
-            filters,
-            eps=mconfig.bn_eps,
-            momentum=mconfig.bn_momentum,
-            groups=mconfig.gn_groups)
+        if mconfig.conv_dropout and block_args.expand_ratio > 1:
+            layers.append(nn.Dropout(mconfig.conv_dropout))
 
         if self._has_se:
             num_reduced_filters = max(
                 1, int(input_filters * block_args.se_ratio))
-            self._se = SELayer(mconfig, filters, num_reduced_filters, filters)
-        else:
-            self._se = None
+            layers.append(
+                SELayer(mconfig, filters, num_reduced_filters, filters))
 
         # Output phase.
-        self._project_conv = nn.Conv2d(
-            filters,
-            block_args.output_filters,
-            kernel_size=1,
-            stride=1,
-            padding='same',
-            bias=False)
-        utils.conv_kernel_initialize(self._project_conv)
-        self._norm2 = utils.normalization(
-            mconfig.bn_type,
-            block_args.output_filters,
-            eps=mconfig.bn_eps,
-            momentum=mconfig.bn_momentum,
-            groups=mconfig.gn_groups)
+        layers.append(
+            nn.Sequential(
+                nn.Conv2d(
+                    filters,
+                    block_args.output_filters,
+                    kernel_size=1,
+                    stride=1,
+                    padding='same',
+                    bias=False),
+                utils.normalization(
+                    mconfig.bn_type,
+                    block_args.output_filters,
+                    eps=mconfig.bn_eps,
+                    momentum=mconfig.bn_momentum,
+                    groups=mconfig.gn_groups)
+            )
+        )
 
-        if mconfig.conv_dropout and block_args.expand_ratio > 1:
-            self._dropout = nn.Dropout(mconfig.conv_dropout)
-        else:
-            self._dropout = None
+        self.block = nn.Sequential(*layers)
 
     def residual(self, inputs, x, survival_prob):
         if (self._block_args.strides == 1 and
@@ -200,7 +208,7 @@ class MBConvBlock(nn.Module):
             # Apply only if skip connection presents.
             if survival_prob:
                 x = utils.drop_connect(x, self.training, survival_prob)
-            x = torch.add(x, inputs)
+            x += inputs
 
         return x
 
@@ -214,19 +222,7 @@ class MBConvBlock(nn.Module):
         Return:
             A output tensor.
         """
-        x = inputs
-        if self._block_args.expand_ratio != 1:
-            x = self._act(self._norm0(self._expand_conv(x)))
-
-        x = self._act(self._norm1(self._depthwise_conv(x)))
-
-        if self._dropout:
-            x = self._dropout(x)
-
-        if self._se:
-            x = self._se(x)
-
-        x = self._norm2(self._project_conv(x))
+        x = self.block(inputs)
         x = self.residual(inputs, x, survival_prob)
         return x
 
@@ -241,51 +237,60 @@ class FusedMBConvBlock(MBConvBlock):
         input_filters = block_args.input_filters
         filters = input_filters * block_args.expand_ratio
         kernel_size = block_args.kernel_size
+
+        layers: List[nn.Module] = []
+
         if block_args.expand_ratio != 1:
             # Expansion phase:
-            self._expand_conv = nn.Conv2d(
-                input_filters,
-                filters,
-                kernel_size=kernel_size,
-                stride=block_args.strides,
-                padding=kernel_size // 2,
-                bias=False)
-            utils.conv_kernel_initialize(self._expand_conv)
-            self._norm0 = utils.normalization(
-                mconfig.bn_type,
-                filters,
-                eps=mconfig.bn_eps,
-                momentum=mconfig.bn_momentum,
-                groups=mconfig.gn_groups)
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        input_filters,
+                        filters,
+                        kernel_size=kernel_size,
+                        stride=block_args.strides,
+                        padding=kernel_size // 2,
+                        bias=False),
+                    utils.normalization(
+                        mconfig.bn_type,
+                        filters,
+                        eps=mconfig.bn_eps,
+                        momentum=mconfig.bn_momentum,
+                        groups=mconfig.gn_groups),
+                    utils.get_act_fn(mconfig.act_fn)(filters)
+                )
+            )
 
-        self._act = utils.get_act_fn(mconfig.act_fn)(filters)
+        if mconfig.conv_dropout and block_args.expand_ratio > 1:
+            layers.append(nn.Dropout(mconfig.conv_dropout))
 
         if self._has_se:
             num_reduced_filters = max(
                 1, int(input_filters * block_args.se_ratio))
-            self._se = SELayer(mconfig, filters, num_reduced_filters, filters)
-        else:
-            self._se = None
-        # Output phase:
-        self._project_conv = nn.Conv2d(
-            filters,
-            block_args.output_filters,
-            kernel_size=1 if block_args.expand_ratio != 1 else kernel_size,
-            stride=1 if block_args.expand_ratio != 1 else block_args.strides,
-            padding='same' if block_args.expand_ratio != 1 else kernel_size // 2,
-            bias=False)
-        utils.conv_kernel_initialize(self._project_conv)
-        self._norm1 = utils.normalization(
-            mconfig.bn_type,
-            block_args.output_filters,
-            eps=mconfig.bn_eps,
-            momentum=mconfig.bn_momentum,
-            groups=mconfig.gn_groups)
+            layers.append(
+                SELayer(mconfig, filters, num_reduced_filters, filters))
 
-        if mconfig.conv_dropout and block_args.expand_ratio > 1:
-            self._dropout = nn.Dropout(mconfig.conv_dropout)
-        else:
-            self._dropout = None
+        # Output phase:
+        stage: List[nn.Module] = [
+            nn.Conv2d(
+                filters,
+                block_args.output_filters,
+                kernel_size=1 if block_args.expand_ratio != 1 else kernel_size,
+                stride=1 if block_args.expand_ratio != 1 else block_args.strides,
+                padding='same' if block_args.expand_ratio != 1 else kernel_size // 2,
+                bias=False),
+            utils.normalization(
+                mconfig.bn_type,
+                block_args.output_filters,
+                eps=mconfig.bn_eps,
+                momentum=mconfig.bn_momentum,
+                groups=mconfig.gn_groups)
+        ]
+        if self._block_args.expand_ratio == 1:
+            stage.append(utils.get_act_fn(mconfig.act_fn)(block_args.output_filters))
+
+        layers.append(nn.Sequential(*stage))
+        self.block = nn.Sequential(*layers)
 
     def forward(self, inputs, survival_prob=None):
         """Implementation of forward().
@@ -297,95 +302,57 @@ class FusedMBConvBlock(MBConvBlock):
         Return:
             A output tensor.
         """
-        x = inputs
-        if self._block_args.expand_ratio != 1:
-            x = self._act(self._norm0(self._expand_conv(x)))
-
-        if self._dropout:
-            x = self._dropout(x)
-
-        if self._se:
-            x = self._se(x)
-
-        x = self._norm1(self._project_conv(x))
-        if self._block_args.expand_ratio == 1:
-            x = self._act(x)
-
+        x = self.block(inputs)
         x = self.residual(inputs, x, survival_prob)
         return x
 
 
-class Stem(nn.Module):
+class Stem(nn.Sequential):
     """Stem layer at the begining of the network."""
 
     def __init__(self, mconfig, in_channels, stem_filters):
-        super(Stem, self).__init__()
         out_channels = utils.round_filters(stem_filters, mconfig)
-        self._conv_stem = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            bias=False)
-        utils.conv_kernel_initialize(self._conv_stem)
-        self._norm = utils.normalization(
-            mconfig.bn_type,
-            out_channels,
-            eps=mconfig.bn_eps,
-            momentum=mconfig.bn_momentum,
-            groups=mconfig.gn_groups)
-        self._act = utils.get_act_fn(mconfig.act_fn)(out_channels)
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False),
+            utils.normalization(
+                mconfig.bn_type,
+                out_channels,
+                eps=mconfig.bn_eps,
+                momentum=mconfig.bn_momentum,
+                groups=mconfig.gn_groups),
+            utils.get_act_fn(mconfig.act_fn)(out_channels)
+        ]
+        super().__init__(*layers)
 
-    def forward(self, inputs):
-        return self._act(self._norm(self._conv_stem(inputs)))
 
-
-class Head(nn.Module):
+class Head(nn.Sequential):
     """Head layer for network outputs."""
 
     def __init__(self, mconfig, in_channels):
-        super(Head, self).__init__()
-
-        self._mconfig = mconfig
         out_channels = utils.round_filters(mconfig.feature_size or 1280, mconfig)
-
-        self._conv_head = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            padding='same',
-            bias=False)
-        utils.conv_kernel_initialize(self._conv_head)
-        self._norm = utils.normalization(
-            mconfig.bn_type,
-            out_channels,
-            eps=mconfig.bn_eps,
-            momentum=mconfig.bn_momentum,
-            groups=mconfig.gn_groups)
-        self._act = utils.get_act_fn(mconfig.act_fn)(out_channels)
-
-        self._avg_pooling = nn.AdaptiveAvgPool2d(1)
-
-        if mconfig.dropout_rate > 0:
-            self._dropout = nn.Dropout(mconfig.dropout_rate)
-        else:
-            self._dropout = None
-
-    def forward(self, inputs):
-        """Call the layer."""
-        outputs = self._act(self._norm(self._conv_head(inputs)))
-
-        if self._mconfig.local_pooling:
-            outputs = F.adaptive_avg_pool2d(outputs, 1)
-            if self._dropout:
-                outputs = self._dropout(outputs)
-        else:
-            outputs = self._avg_pooling(outputs)
-            if self._dropout:
-                outputs = self._dropout(outputs)
-        return outputs
+        layers = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=1,
+                padding='same',
+                bias=False),
+            utils.normalization(
+                mconfig.bn_type,
+                out_channels,
+                eps=mconfig.bn_eps,
+                momentum=mconfig.bn_momentum,
+                groups=mconfig.gn_groups),
+            utils.get_act_fn(mconfig.act_fn)(out_channels)
+        ]
+        super().__init__(*layers)
 
 
 class EfficientNet(nn.Module):
@@ -419,13 +386,14 @@ class EfficientNet(nn.Module):
 
     def _build(self):
         """Builds a model."""
-        self._blocks = nn.ModuleList()
+        layers: List[nn.Module] = []
 
         # Stem part.
-        self._stem = Stem(self._mconfig, self.image_channels, self._mconfig.blocks_args[0].input_filters)
+        layers.append(Stem(self._mconfig, self.image_channels, self._mconfig.blocks_args[0].input_filters))
 
         # Builds blocks.
         for block_args in self._mconfig.blocks_args:
+            stage: List[nn.Module] = []
             assert block_args.num_repeat > 0
             # Update block input and output filters based on depth multiplier.
             input_filters = utils.round_filters(block_args.input_filters, self._mconfig)
@@ -440,28 +408,34 @@ class EfficientNet(nn.Module):
 
             # The first block needs to take care of stride and filter size increase.
             conv_block = {0: MBConvBlock, 1: FusedMBConvBlock}[block_args.conv_type]
-            self._blocks.append(
+            stage.append(
                 conv_block(block_args, self._mconfig))
             if block_args.num_repeat > 1:  # rest of blocks with the same block_arg
                 block_args.input_filters = block_args.output_filters
                 block_args.strides = 1
             for _ in range(block_args.num_repeat - 1):
-                self._blocks.append(
+                stage.append(
                     conv_block(block_args, self._mconfig))
+            layers.append(nn.Sequential(*stage))
 
         # Head part.
-        input_filters = self._mconfig.blocks_args[-1].input_filters
-        self._head = Head(self._mconfig, input_filters)
+        input_filters = self._mconfig.blocks_args[-1].output_filters
+        layers.append(Head(self._mconfig, input_filters))
+
+        self.features = nn.Sequential(*layers)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
 
         # top part for classification
         if self.include_top and self._mconfig.num_classes:
             in_channels = utils.round_filters(self._mconfig.feature_size or 1280, self._mconfig)
-            self._fc = nn.Linear(
-                in_channels,
-                self._mconfig.num_classes)
-            utils.linear_weight_initialize(self._fc, self._mconfig.headbias or 0)
+            linear = nn.Linear(in_channels, self._mconfig.num_classes)
+            utils.linear_weight_initialize(linear, self._mconfig.headbias or 0)
+            self.classifier = nn.Sequential(
+                nn.Dropout(self._mconfig.dropout_rate),
+                linear
+            )
         else:
-            self._fc = None
+            self.classifier = None
 
     def forward(self, inputs):
         """Implementation of forward().
@@ -472,33 +446,12 @@ class EfficientNet(nn.Module):
         Returns:
             output tensors.
         """
-        outputs = None
-        reduction_idx = 0
+        outputs = self.features(inputs)
 
-        # Calls Stem layers
-        outputs = self._stem(inputs)
+        outputs = self.avgpool(outputs)
+        outputs = torch.flatten(outputs, 1)
 
-        # Calls blocks.
-        for idx, block in enumerate(self._blocks):
-            is_reduction = False  # reduction flag for blocks after the stem layer
-            if ((idx == len(self._blocks) - 1) or
-                    self._blocks[idx + 1]._block_args.strides > 1):
-                is_reduction = True
-                reduction_idx += 1
-
-            survival_prob = self._mconfig.survival_prob
-            if survival_prob:
-                drop_rate = 1.0 - survival_prob
-                survival_prob = 1.0 - drop_rate * float(idx) / len(self._blocks)
-            outputs = block(outputs, survival_prob=survival_prob)
-
-        # Head to obtain the final feature.
-        outputs = self._head(outputs)
-
-        # Calls final dense layers and returns logits.
-        if self._fc:
-            outputs = torch.squeeze(outputs)
-            outputs = self._fc(outputs)
+        outputs = self.classifier(outputs)
 
         return outputs
 
@@ -606,8 +559,7 @@ def efficientnet_b5(pretrained: bool = False, progress: bool = True) -> Efficien
         0.4,
         pretrained,
         progress,
-        eps=0.001,
-        momentum=0.01
+        option={'bn_eps': 0.001, 'bn_momentum': 0.01}
     )
 
 
@@ -627,8 +579,7 @@ def efficientnet_b6(pretrained: bool = False, progress: bool = True) -> Efficien
         0.5,
         pretrained,
         progress,
-        eps=0.001,
-        momentum=0.01
+        option={'bn_eps': 0.001, 'bn_momentum':0.01}
     )
 
 
@@ -648,8 +599,7 @@ def efficientnet_b7(pretrained: bool = False, progress: bool = True) -> Efficien
         0.5,
         pretrained,
         progress,
-        eps=0.001,
-        momentum=0.01
+        option={'bn_eps': 0.001, 'bn_momentum': 0.01}
     )
 
 
