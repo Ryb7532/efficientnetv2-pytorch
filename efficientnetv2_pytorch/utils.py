@@ -1,7 +1,6 @@
 """Utilities."""
 import functools
 import math
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -254,26 +253,6 @@ class Config(dict):
             else:
                 config_dict[k] = copy.deepcopy(v)
         return config_dict
-
-
-def conv_kernel_initialize(conv):
-    """Initializes weight of the convolutional layer.
-
-    Args:
-        conv: nn.Module instance
-    """
-    nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
-
-
-def linear_weight_initialize(linear, bias):
-    """Initializes weight of the linear layer.
-
-    Args:
-        linear: nn.Module instance
-    """
-    init_range = 1.0 / np.sqrt(linear.weight.shape[0])
-    nn.init.uniform_(linear.weight, -init_range, init_range)
-    nn.init.constant_(linear.bias, bias)
 
 
 def round_filters(filters, mconfig, skip=False):

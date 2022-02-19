@@ -16,6 +16,7 @@ import copy
 from typing import Optional, List
 from matplotlib import scale
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -428,14 +429,22 @@ class EfficientNet(nn.Module):
         # top part for classification
         if self.include_top and self._mconfig.num_classes:
             in_channels = utils.round_filters(self._mconfig.feature_size or 1280, self._mconfig)
-            linear = nn.Linear(in_channels, self._mconfig.num_classes)
-            utils.linear_weight_initialize(linear, self._mconfig.headbias or 0)
             self.classifier = nn.Sequential(
                 nn.Dropout(self._mconfig.dropout_rate),
-                linear
+                nn.Linear(in_channels, self._mconfig.num_classes)
             )
         else:
             self.classifier = None
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                init_range = 1.0 / np.sqrt(m.out_features)
+                nn.init.uniform_(m.weight, -init_range, init_range)
+                nn.init.constant_(m.bias, self._mconfig.headbias or 0)
 
     def forward(self, inputs):
         """Implementation of forward().
