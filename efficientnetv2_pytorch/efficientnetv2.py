@@ -13,19 +13,20 @@ EfficientNet V1 and V2 model.
     https://arxiv.org/abs/2104.00298
 """
 import copy
-from typing import Optional, List
-from matplotlib import scale
+from ctypes import Union
+from functools import partial
+import math
+from typing import Any, Callable, Optional, List, Sequence, Union
 
 import numpy as np
 import torch
+from torch import Tensor
 import torch.nn as nn
-import torch.nn.functional as F
-
-from . import utils
-from .utils import Config
-from .config import *
 
 from torchvision._internally_replaced_utils import load_state_dict_from_url
+from torchvision.ops import StochasticDepth
+from torchvision.ops.misc import ConvNormActivation, SqueezeExcitation
+from torchvision.models._utils import _make_divisible
 
 
 __all__ = [
@@ -59,301 +60,225 @@ model_urls = {
 }
 
 
-class SELayer(nn.Module):
-    """Squeeze-and-excitation layer."""
+class ModelConfig:
+    # Stores infomation of global model parameters
+    def __init__(
+        self,
+        model_name: str,
+        feature_size: int = 1280,
+        stochastic_depth_prob: float = 0.2,
+        conv_dropout: Optional[float] = None,
+        dropout_rate: Optional[float] = None,
+    ) -> None:
+        self.model_name = model_name
+        self.feature_size = feature_size
+        self.stochastic_depth_prob = stochastic_depth_prob
+        self.conv_dropout = conv_dropout
+        self.dropout_rate = dropout_rate
 
-    def __init__(self, mconfig, in_channels, se_filters, output_filters):
-        super(SELayer, self).__init__()
-
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        # Squeeze and Excitation layer.
-        self.fc1 = nn.Conv2d(
-            in_channels,
-            se_filters,
-            kernel_size=1,
-            stride=1,
-            padding='same',
-            bias=True)
-        self.fc2 = nn.Conv2d(
-            se_filters,
-            output_filters,
-            kernel_size=1,
-            stride=1,
-            padding='same',
-            bias=True)
-
-        self.activation = utils.get_act_fn(mconfig.act_fn)(se_filters)
-        self.scale_activation = nn.Sigmoid()
-
-    def _scale(self, inputs):
-        scale = self.avgpool(inputs)
-        scale = self.fc1(scale)
-        scale = self.activation(scale)
-        scale = self.fc2(scale)
-        scale = self.scale_activation(scale)
-        return scale
-
-    def forward(self, inputs):
-        scale = self._scale(inputs)
-        return scale * inputs
+    def __repr__(self) -> str:
+        s = (
+            f"{self.__class__.__name__}("
+            f"model_name={self.model_name}"
+            f", feature_size={self.feature_size}"
+            f", stochastic_depth_prob={self.stochastic_depth_prob}"
+            f", conv_dropout={self.conv_dropout}"
+            f", dropout_rate={self.dropout_rate}"
+            f")"
+        )
+        return s
 
 
-class MBConvBlock(nn.Module):
-    """A class of MBConv: Mobile Inverted Residual Bottleneck."""
+class MBConvConfig:
+    # Stores information listed at Table 1 of the EfficientNet paper and block type (0: MBConv, 1: FusedMBConv)
+    def __init__(
+        self,
+        expand_ratio: float,
+        kernel: int,
+        stride: int,
+        input_channels: int,
+        out_channels: int,
+        num_layers: int,
+        se_ratio: float,
+        width_mult: float,
+        depth_mult: float,
+    ) -> None:
+        self.expand_ratio = expand_ratio
+        self.kernel = kernel
+        self.stride = stride
+        self.input_channels = self.adjust_channels(input_channels, width_mult)
+        self.out_channels = self.adjust_channels(out_channels, width_mult)
+        self.num_layers = self.adjust_depth(num_layers, depth_mult)
+        self.se_ratio = se_ratio
+        self.block_type = 1 if se_ratio == 0 else 0
 
-    def __init__(self, block_args, mconfig):
-        """Initializes a MBConv block.
+    def __repr__(self) -> str:
+        s = (
+            f"{self.__class__.__name__}("
+            f"expand_ratio={self.expand_ratio}"
+            f", kernel={self.kernel}"
+            f", stride={self.stride}"
+            f", input_channels={self.input_channels}"
+            f", out_channels={self.out_channels}"
+            f", num_layers={self.num_layers}"
+            f", se_ratio={self.se_ratio}"
+            f", block_type={self.block_type}"
+            f")"
+        )
+        return s
 
-        Args:
-            block_args: BlockArgs, arguments to create a Block.
-            mconfig: GlobalParams, a set of global parameters.
-        """
-        super(MBConvBlock, self).__init__()
+    @staticmethod
+    def adjust_channels(channels: int, width_mult: float, min_value: Optional[int] = None) -> int:
+        return _make_divisible(channels * width_mult, 8, min_value)
 
-        self._block_args = copy.deepcopy(block_args)
-        self._mconfig = copy.deepcopy(mconfig)
+    @staticmethod
+    def adjust_depth(num_layers: int, depth_mult: float):
+        return int(math.ceil(num_layers * depth_mult))
 
-        self._has_se = (
-            self._block_args.se_ratio is not None and
-            0 < self._block_args.se_ratio <= 1)
 
-        # Builds the block accordings to arguments.
-        self._build()
 
-    def _build(self):
-        """Builds block according to the arguments."""
-        mconfig = self._mconfig
-        block_args = self._block_args
-        input_filters = block_args.input_filters
-        filters = input_filters * block_args.expand_ratio
-        kernel_size = block_args.kernel_size
+class MBConv(nn.Module):
+    def __init__(
+        self,
+        cnf: MBConvConfig,
+        stochastic_depth_prob: float,
+        dropout_rate: Optional[float],
+        activation_layer: Callable[..., nn.Module],
+        norm_layer: Callable[..., nn.Module],
+        se_layer: Callable[..., nn.Module] = SqueezeExcitation,
+    ) -> None:
+        super().__init__()
 
+        self.use_res_connect = cnf.stride == 1 and cnf.input_channels == cnf.out_channels
+        self.use_dropout = dropout_rate and cnf.expand_ratio > 1
+        self.dropout_rate = dropout_rate
+
+        self._build(cnf, activation_layer, norm_layer, se_layer)
+
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
+        self.out_channels = cnf.out_channels
+
+
+    def _build(self,
+        cnf: MBConvConfig,
+        activation_layer: Callable[..., nn.Module],
+        norm_layer: Callable[..., nn.Module],
+        se_layer: Callable[..., nn.Module],
+    ) -> None:
         layers: List[nn.Module] = []
 
-        # Expansion phase. Called if not using fused convolutions and expansion
-        # phase is necessary.
-        if block_args.expand_ratio != 1:
+        # expand
+        expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
+        if expanded_channels != cnf.input_channels:
             layers.append(
-                nn.Sequential(
-                    nn.Conv2d(
-                        input_filters,
-                        filters,
-                        kernel_size=1,
-                        stride=1,
-                        padding='same',
-                        bias=False),
-                    utils.normalization(
-                        mconfig.bn_type,
-                        filters,
-                        eps=mconfig.bn_eps,
-                        momentum=mconfig.bn_momentum,
-                        groups=mconfig.gn_groups),
-                    utils.get_act_fn(mconfig.act_fn)(filters)
-                )
-            )
-
-        # Depth-wise convolution phase. Called if not using fused convolutions.
-        layers.append(
-            nn.Sequential(
-                nn.Conv2d(
-                    filters,
-                    filters,
-                    kernel_size=kernel_size,
-                    stride=block_args.strides,
-                    padding=kernel_size // 2,
-                    groups=filters,
-                    bias=False),
-                utils.normalization(
-                    mconfig.bn_type,
-                    filters,
-                    eps=mconfig.bn_eps,
-                    momentum=mconfig.bn_momentum,
-                    groups=mconfig.gn_groups),
-                utils.get_act_fn(mconfig.act_fn)(filters)
-            )
-        )
-
-        if mconfig.conv_dropout and block_args.expand_ratio > 1:
-            layers.append(nn.Dropout(mconfig.conv_dropout))
-
-        if self._has_se:
-            num_reduced_filters = max(
-                1, int(input_filters * block_args.se_ratio))
-            layers.append(
-                SELayer(mconfig, filters, num_reduced_filters, filters))
-
-        # Output phase.
-        layers.append(
-            nn.Sequential(
-                nn.Conv2d(
-                    filters,
-                    block_args.output_filters,
+                ConvNormActivation(
+                    cnf.input_channels,
+                    expanded_channels,
                     kernel_size=1,
-                    stride=1,
-                    padding='same',
-                    bias=False),
-                utils.normalization(
-                    mconfig.bn_type,
-                    block_args.output_filters,
-                    eps=mconfig.bn_eps,
-                    momentum=mconfig.bn_momentum,
-                    groups=mconfig.gn_groups)
+                    norm_layer=norm_layer,
+                    activation_layer=activation_layer,
+                )
+            )
+
+        # depthwise
+        layers.append(
+            ConvNormActivation(
+                expanded_channels,
+                expanded_channels,
+                kernel_size=cnf.kernel,
+                stride=cnf.stride,
+                groups=expanded_channels,
+                norm_layer=norm_layer,
+                activation_layer=activation_layer,
+            )
+        )
+
+        if self.use_dropout:
+            layers.append(nn.Dropout(self.dropout_rate))
+
+        if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
+            num_reduced_channels = max(
+                1, int(cnf.input_channels * cnf.se_ratio))
+            layers.append(
+                se_layer(
+                    expanded_channels,
+                    num_reduced_channels,
+                    activation=activation_layer,
+                )
+            )
+
+        # project
+        layers.append(
+            ConvNormActivation(
+                expanded_channels,
+                cnf.out_channels,
+                kernel_size=1,
+                norm_layer=norm_layer,
+                activation_layer=None,
             )
         )
 
         self.block = nn.Sequential(*layers)
 
-    def residual(self, inputs, x, survival_prob):
-        if (self._block_args.strides == 1 and
-            self._block_args.input_filters == self._block_args.output_filters):
-            # Apply only if skip connection presents.
-            if survival_prob:
-                x = utils.drop_connect(x, self.training, survival_prob)
-            x += inputs
-
-        return x
-
-    def forward(self, inputs, survival_prob=None):
-        """Implementation of forward().
-
-        Args:
-            inputs: the inputs tensor.
-            survival_prob: float, between 0 to 1, drop connect rate.
-
-        Return:
-            A output tensor.
-        """
-        x = self.block(inputs)
-        x = self.residual(inputs, x, survival_prob)
-        return x
+    def forward(self, input: Tensor) -> Tensor:
+        result = self.block(input)
+        if self.use_res_connect:
+            result = self.stochastic_depth(result)
+            result += input
+        return result
 
 
-class FusedMBConvBlock(MBConvBlock):
-    """Fusing the proj conv1x1 and depthwise_conv into a conv2d."""
-
-    def _build(self):
-        """Builds block according to the arguments."""
-        mconfig = self._mconfig
-        block_args = self._block_args
-        input_filters = block_args.input_filters
-        filters = input_filters * block_args.expand_ratio
-        kernel_size = block_args.kernel_size
-
+class FusedMBConv(MBConv):
+    def _build(self,
+        cnf: MBConvConfig,
+        activation_layer: Callable[..., nn.Module],
+        norm_layer: Callable[..., nn.Module],
+        se_layer: Callable[..., nn.Module],
+    ) -> None:
         layers: List[nn.Module] = []
 
-        if block_args.expand_ratio != 1:
-            # Expansion phase:
+        # expand
+        expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
+        if expanded_channels != cnf.input_channels:
             layers.append(
-                nn.Sequential(
-                    nn.Conv2d(
-                        input_filters,
-                        filters,
-                        kernel_size=kernel_size,
-                        stride=block_args.strides,
-                        padding=kernel_size // 2,
-                        bias=False),
-                    utils.normalization(
-                        mconfig.bn_type,
-                        filters,
-                        eps=mconfig.bn_eps,
-                        momentum=mconfig.bn_momentum,
-                        groups=mconfig.gn_groups),
-                    utils.get_act_fn(mconfig.act_fn)(filters)
+                ConvNormActivation(
+                    cnf.input_channels,
+                    expanded_channels,
+                    kernel_size=cnf.kernel,
+                    stride=cnf.stride,
+                    norm_layer=norm_layer,
+                    activation_layer=activation_layer,
                 )
             )
 
-        if mconfig.conv_dropout and block_args.expand_ratio > 1:
-            layers.append(nn.Dropout(mconfig.conv_dropout))
+        if self.use_dropout:
+            layers.append(nn.Dropout(self.dropout_rate))
 
-        if self._has_se:
-            num_reduced_filters = max(
-                1, int(input_filters * block_args.se_ratio))
+        if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
+            num_reduced_channels = max(
+                1, int(cnf.input_channels * cnf.se_ratio))
             layers.append(
-                SELayer(mconfig, filters, num_reduced_filters, filters))
+                se_layer(
+                    expanded_channels,
+                    num_reduced_channels,
+                    activation=activation_layer,
+                )
+            )
 
-        # Output phase:
-        stage: List[nn.Module] = [
-            nn.Conv2d(
-                filters,
-                block_args.output_filters,
-                kernel_size=1 if block_args.expand_ratio != 1 else kernel_size,
-                stride=1 if block_args.expand_ratio != 1 else block_args.strides,
-                padding='same' if block_args.expand_ratio != 1 else kernel_size // 2,
-                bias=False),
-            utils.normalization(
-                mconfig.bn_type,
-                block_args.output_filters,
-                eps=mconfig.bn_eps,
-                momentum=mconfig.bn_momentum,
-                groups=mconfig.gn_groups)
-        ]
-        if self._block_args.expand_ratio == 1:
-            stage.append(utils.get_act_fn(mconfig.act_fn)(block_args.output_filters))
+        # project
+        layers.append(
+            ConvNormActivation(
+                expanded_channels,
+                cnf.out_channels,
+                kernel_size=1 if cnf.expand_ratio != 1 else cnf.kernel,
+                stride=1 if cnf.expand_ratio != 1 else cnf.stride,
+                norm_layer=norm_layer,
+                activation_layer=None if cnf.expand_ratio != 1 else activation_layer,
+            )
+        )
 
-        layers.append(nn.Sequential(*stage))
         self.block = nn.Sequential(*layers)
 
-    def forward(self, inputs, survival_prob=None):
-        """Implementation of forward().
-
-        Args:
-            inputs: the inputs tensor.
-            survival_prob: float, between 0 to 1, drop connect rate.
-
-        Return:
-            A output tensor.
-        """
-        x = self.block(inputs)
-        x = self.residual(inputs, x, survival_prob)
-        return x
-
-
-class Stem(nn.Sequential):
-    """Stem layer at the begining of the network."""
-
-    def __init__(self, mconfig, in_channels, stem_filters):
-        out_channels = utils.round_filters(stem_filters, mconfig)
-        layers = [
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                bias=False),
-            utils.normalization(
-                mconfig.bn_type,
-                out_channels,
-                eps=mconfig.bn_eps,
-                momentum=mconfig.bn_momentum,
-                groups=mconfig.gn_groups),
-            utils.get_act_fn(mconfig.act_fn)(out_channels)
-        ]
-        super().__init__(*layers)
-
-
-class Head(nn.Sequential):
-    """Head layer for network outputs."""
-
-    def __init__(self, mconfig, in_channels):
-        out_channels = utils.round_filters(mconfig.feature_size or 1280, mconfig)
-        layers = [
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                padding='same',
-                bias=False),
-            utils.normalization(
-                mconfig.bn_type,
-                out_channels,
-                eps=mconfig.bn_eps,
-                momentum=mconfig.bn_momentum,
-                groups=mconfig.gn_groups),
-            utils.get_act_fn(mconfig.act_fn)(out_channels)
-        ]
-        super().__init__(*layers)
 
 
 class EfficientNet(nn.Module):
@@ -363,88 +288,114 @@ class EfficientNet(nn.Module):
     """
 
     def __init__(self,
-                 model_config=None,
-                 include_top=True,
-                 image_channels=3):
-        """Initializes an instance.
+                 model_cnf: ModelConfig,
+                 inverted_residual_setting: List[MBConvConfig],
+                 num_classes: int = 1000,
+                 image_channels: int = 3,
+                 activation_layer: Optional[Callable[..., nn.Module]] = None,
+                 norm_layer: Optional[Callable[..., nn.Module]] = None,
+                 **kwars: Any,
+    ) -> None:
+        """EfficientNet main class
 
         Args:
-            model_config: A dict of model configurations or a string of hparams.
-            include_top: If True, include the top layer for classification.
-            image_channels: Number of image channels (default: 3)
-
-        Raises:
-            ValueError: when blocks_args is not specified as a list.
+            model_cnf (ModelConfig): Global model parameters
+            inverted_residual_setting (List[MBConvConfig]): Network structure
+            num_classes (int): Number of classes
+            image_channels (int): Number of image channels (default: 3)
         """
-        super(EfficientNet, self).__init__()
-        cfg = copy.deepcopy(base_config)
-        cfg.model.override(model_config)
-        self.cfg = cfg
-        self._mconfig = cfg.model
-        self.include_top = include_top
-        self.image_channels = image_channels
-        self._build()
+        super().__init__()
 
-    def _build(self):
-        """Builds a model."""
+        if not inverted_residual_setting:
+            raise ValueError("The inverted_residual_setting should not be empty")
+        elif not (
+            isinstance(inverted_residual_setting, Sequence)
+            and all([isinstance(s, MBConvConfig) for s in inverted_residual_setting])
+        ):
+            raise TypeError("The inverted_residual_setting should be List[MBConvConfig]")
+
         layers: List[nn.Module] = []
 
-        # Stem part.
-        layers.append(Stem(self._mconfig, self.image_channels, self._mconfig.blocks_args[0].input_filters))
+        if activation_layer is None:
+            activation_layer = nn.SiLU
 
-        # Builds blocks.
-        for block_args in self._mconfig.blocks_args:
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+
+        # building stem layer
+        firstconv_output_channels = inverted_residual_setting[0].input_channels
+        layers.append(
+            ConvNormActivation(
+                image_channels,
+                firstconv_output_channels,
+                kernel_size=3,
+                stride=2,
+                norm_layer=norm_layer,
+                activation_layer=activation_layer,
+            )
+        )
+
+        # building inverted residual blocks
+        total_stage_blocks = sum(cnf.num_layers for cnf in inverted_residual_setting)
+        stage_block_id = 0
+        for cnf in inverted_residual_setting:
             stage: List[nn.Module] = []
-            assert block_args.num_repeat > 0
-            # Update block input and output filters based on depth multiplier.
-            input_filters = utils.round_filters(block_args.input_filters, self._mconfig)
-            output_filters = utils.round_filters(block_args.output_filters, self._mconfig)
-            repeats = utils.round_repeats(block_args.num_repeat,
-                                    self._mconfig.depth_coefficient)
-            block_args.update(
-                dict(
-                  input_filters=input_filters,
-                  output_filters=output_filters,
-                  num_repeat=repeats))
 
-            # The first block needs to take care of stride and filter size increase.
-            conv_block = {0: MBConvBlock, 1: FusedMBConvBlock}[block_args.conv_type]
-            stage.append(
-                conv_block(block_args, self._mconfig))
-            if block_args.num_repeat > 1:  # rest of blocks with the same block_arg
-                block_args.input_filters = block_args.output_filters
-                block_args.strides = 1
-            for _ in range(block_args.num_repeat - 1):
+            block = {0: MBConv, 1: FusedMBConv}[cnf.block_type]
+
+            for _ in range(cnf.num_layers):
+                # copy to avoid modifications. shallow copy is enough
+                block_cnf = copy.copy(cnf)
+
+                # overwrite info if not the first conv in the stage
+                if stage:
+                    block_cnf.input_channels = block_cnf.out_channels
+                    block_cnf.stride = 1
+
+                # adjust stochastic depth probability based on the depth of the stage block
+                sd_prob = model_cnf.stochastic_depth_prob * float(stage_block_id) / total_stage_blocks
+
                 stage.append(
-                    conv_block(block_args, self._mconfig))
+                    block(
+                        block_cnf, sd_prob, model_cnf.conv_dropout, activation_layer, norm_layer
+                    )
+                )
+                stage_block_id += 1
+
             layers.append(nn.Sequential(*stage))
 
-        # Head part.
-        input_filters = self._mconfig.blocks_args[-1].output_filters
-        layers.append(Head(self._mconfig, input_filters))
+        # building head layer
+        lastconv_input_channels = inverted_residual_setting[-1].out_channels
+        lastconv_output_channels = model_cnf.feature_size
+        layers.append(
+            ConvNormActivation(
+                lastconv_input_channels,
+                lastconv_output_channels,
+                kernel_size=1,
+                norm_layer=norm_layer,
+                activation_layer=activation_layer
+            )
+        )
 
         self.features = nn.Sequential(*layers)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
-
-        # top part for classification
-        if self.include_top and self._mconfig.num_classes:
-            in_channels = utils.round_filters(self._mconfig.feature_size or 1280, self._mconfig)
-            self.classifier = nn.Sequential(
-                nn.Dropout(self._mconfig.dropout_rate),
-                nn.Linear(in_channels, self._mconfig.num_classes)
-            )
-        else:
-            self.classifier = None
+        self.classifier = nn.Sequential(
+            nn.Dropout(model_cnf.dropout_rate),
+            nn.Linear(lastconv_output_channels, num_classes)
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
                 init_range = 1.0 / np.sqrt(m.out_features)
                 nn.init.uniform_(m.weight, -init_range, init_range)
-                nn.init.constant_(m.bias, self._mconfig.headbias or 0)
+                nn.init.zeros_(m.bias)
 
     def forward(self, inputs):
         """Implementation of forward().
@@ -469,25 +420,25 @@ def _efficientnet(
     arch: str,
     width_mult: float,
     depth_mult: float,
-    isize: int,
     dropout: float,
     pretrained: bool,
     progress: bool,
-    option: Optional[dict] = None
+    model_cnf: Optional[ModelConfig] = None,
+    **kwargs: Any,
 ) -> EfficientNet:
-    cfg = Config(
-        model=dict(
-          model_name=arch,
-          blocks_args=BlockDecoder().decode(v1_block_cfg),
-          width_coefficient=width_mult,
-          depth_coefficient=depth_mult,
-          dropout_rate=dropout),
-        eval=dict(isize=isize),
-        train=dict(isize=0.8),  # 80% of eval size
-        data=dict(augname='effnetv1_autoaug'))
-    if option:
-        cfg.override(option, allow_new_keys=True)
-    model = EfficientNet(cfg.model)
+    bneck_conf = partial(MBConvConfig, width_mult=width_mult, depth_mult=depth_mult)
+    inverted_residual_setting = [
+        bneck_conf(1, 3, 1, 32, 16, 1, 0.25),
+        bneck_conf(6, 3, 2, 16, 24, 2, 0.25),
+        bneck_conf(6, 5, 2, 24, 40, 2, 0.25),
+        bneck_conf(6, 3, 2, 40, 80, 3, 0.25),
+        bneck_conf(6, 5, 1, 80, 112, 3, 0.25),
+        bneck_conf(6, 5, 2, 112, 192, 4, 0.25),
+        bneck_conf(6, 3, 1, 192, 320, 1, 0.25),
+    ]
+    if model_cnf is None:
+        model_cnf = ModelConfig(arch, dropout_rate=dropout)
+    model = EfficientNet(model_cnf, inverted_residual_setting, **kwargs)
     if pretrained:
         if model_urls.get(arch, None) is None:
             raise ValueError(f"No checkpoint is available for model type {arch}")
@@ -496,7 +447,7 @@ def _efficientnet(
     return model
 
 
-def efficientnet_b0(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b0(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B0 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -504,10 +455,10 @@ def efficientnet_b0(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnet("efficientnet_b0", 1.0, 1.0, 224, 0.2, pretrained, progress)
+    return _efficientnet("efficientnet_b0", 1.0, 1.0, 0.2, pretrained, progress, **kwargs)
 
 
-def efficientnet_b1(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b1(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B1 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -515,10 +466,10 @@ def efficientnet_b1(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnet("efficientnet_b1", 1.0, 1.1, 240, 0.2, pretrained, progress)
+    return _efficientnet("efficientnet_b1", 1.0, 1.1, 0.2, pretrained, progress, **kwargs)
 
 
-def efficientnet_b2(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B2 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -526,10 +477,10 @@ def efficientnet_b2(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnet("efficientnet_b2", 1.1, 1.2, 160, 0.3, pretrained, progress)
+    return _efficientnet("efficientnet_b2", 1.1, 1.2, 0.3, pretrained, progress, **kwargs)
 
 
-def efficientnet_b3(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b3(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B3 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -537,10 +488,10 @@ def efficientnet_b3(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnet("efficientnet_b3", 1.2, 1.4, 300, 0.3, pretrained, progress)
+    return _efficientnet("efficientnet_b3", 1.2, 1.4, 0.3, pretrained, progress, **kwargs)
 
 
-def efficientnet_b4(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b4(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B4 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -548,10 +499,10 @@ def efficientnet_b4(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnet("efficientnet_b4", 1.4, 1.8, 380, 0.4, pretrained, progress)
+    return _efficientnet("efficientnet_b4", 1.4, 1.8, 0.4, pretrained, progress, **kwargs)
 
 
-def efficientnet_b5(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b5(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B5 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -559,20 +510,19 @@ def efficientnet_b5(pretrained: bool = False, progress: bool = True) -> Efficien
         pretrained (bool): If True, returns a model pre-trained on ImageNet
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    base_config.override()
     return _efficientnet(
         "efficientnet_b5",
         1.6,
         2.2,
-        456,
         0.4,
         pretrained,
         progress,
-        option={'bn_eps': 0.001, 'bn_momentum': 0.01}
+        norm_layer=partial(nn.BatchNorm2d, eps=0.001, momentum=0.01),
+        **kwargs,
     )
 
 
-def efficientnet_b6(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b6(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B6 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -584,15 +534,15 @@ def efficientnet_b6(pretrained: bool = False, progress: bool = True) -> Efficien
         "efficientnet_b6",
         1.8,
         2.6,
-        528,
         0.5,
         pretrained,
         progress,
-        option={'bn_eps': 0.001, 'bn_momentum':0.01}
+        norm_layer=partial(nn.BatchNorm2d, eps=0.001, momentum=0.01),
+        **kwargs,
     )
 
 
-def efficientnet_b7(pretrained: bool = False, progress: bool = True) -> EfficientNet:
+def efficientnet_b7(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
     """
     Constructs a EfficientNet B7 architecture from
     `"EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks" <https://arxiv.org/abs/1905.11946>`_.
@@ -608,17 +558,84 @@ def efficientnet_b7(pretrained: bool = False, progress: bool = True) -> Efficien
         0.5,
         pretrained,
         progress,
-        option={'bn_eps': 0.001, 'bn_momentum': 0.01}
+        norm_layer=partial(nn.BatchNorm2d, eps=0.001, momentum=0.01),
+        **kwargs,
     )
+
+
+
+def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mult: float) -> List[MBConvConfig]:
+    if isinstance(cnf, MBConvConfig):
+        return cnf
+    bneck_conf = partial(MBConvConfig, width_mult=width_mult, depth_mult=depth_mult)
+    if cnf == 's':
+        inverted_residual_setting = [
+            bneck_conf(1, 3, 1, 24, 24, 1, 0),
+            bneck_conf(4, 3, 2, 24, 48, 2, 0),
+            bneck_conf(4, 3, 2, 48, 64, 2, 0),
+            bneck_conf(4, 3, 2, 64, 128, 3, 0.25),
+            bneck_conf(6, 3, 1, 128, 160, 5, 0.25),
+            bneck_conf(6, 3, 2, 160, 256, 8, 0.25),
+        ]
+    elif cnf == 'm':
+        inverted_residual_setting = [
+            bneck_conf(1, 3, 1, 24, 24, 3, 0),
+            bneck_conf(4, 3, 2, 24, 48, 5, 0),
+            bneck_conf(4, 3, 2, 48, 80, 5, 0),
+            bneck_conf(4, 3, 2, 80, 160, 7, 0.25),
+            bneck_conf(6, 3, 1, 160, 176, 14, 0.25),
+            bneck_conf(6, 3, 2, 176, 304, 18, 0.25),
+            bneck_conf(6, 3, 1, 304, 512, 5, 0.25),
+        ]
+    elif cnf == 'l':
+        inverted_residual_setting = [
+            bneck_conf(1, 3, 1, 32, 32, 4, 0),
+            bneck_conf(4, 3, 2, 32, 64, 7, 0),
+            bneck_conf(4, 3, 2, 64, 96, 7, 0),
+            bneck_conf(4, 3, 2, 96, 192, 10, 0.25),
+            bneck_conf(6, 3, 1, 192, 224, 19, 0.25),
+            bneck_conf(6, 3, 2, 224, 384, 25, 0.25),
+            bneck_conf(6, 3, 1, 384, 640, 7, 0.25),
+        ]
+    elif cnf == 'xl':
+        inverted_residual_setting = [
+            bneck_conf(1, 3, 1, 32, 32, 4, 0),
+            bneck_conf(4, 3, 2, 32, 64, 8, 0),
+            bneck_conf(4, 3, 2, 64, 96, 8, 0),
+            bneck_conf(4, 3, 2, 96, 192, 16, 0.25),
+            bneck_conf(6, 3, 1, 192, 256, 24, 0.25),
+            bneck_conf(6, 3, 2, 256, 512, 32, 0.25),
+            bneck_conf(6, 3, 1, 512, 640, 8, 0.25),
+        ]
+    elif cnf == 'base':
+        inverted_residual_setting = [
+            bneck_conf(1, 3, 1, 32, 16, 1, 0),
+            bneck_conf(4, 3, 2, 16, 32, 2, 0),
+            bneck_conf(4, 3, 2, 32, 48, 2, 0),
+            bneck_conf(4, 3, 2, 48, 96, 3, 0.25),
+            bneck_conf(6, 3, 1, 96, 112, 5, 0.25),
+            bneck_conf(6, 3, 2, 112, 192, 8, 0.25),
+        ]
+    else:
+        raise ValueError(f"Not found block configs type '{cnf}'")
+    return inverted_residual_setting
 
 
 def _efficientnetv2(
     arch: str,
-    cfg: Config,
+    width_mult: float,
+    depth_mult: float,
+    dropout: float,
     pretrained: bool,
     progress: bool,
+    cnf_kind: Union[str, MBConvConfig] = 'base',
+    model_cnf: Optional[ModelConfig] = None,
+    **kwargs: Any,
 ) -> EfficientNet:
-    model = EfficientNet(cfg.model)
+    inverted_residual_setting = get_block_configs(cnf_kind, width_mult, depth_mult)
+    if model_cnf is None:
+        model_cnf = ModelConfig(arch, dropout_rate=dropout)
+    model = EfficientNet(model_cnf, inverted_residual_setting, **kwargs)
     if pretrained:
         if model_urls.get(arch, None) is None:
             raise ValueError(f"No checkpoint is available for model type {arch}")
@@ -627,67 +644,47 @@ def _efficientnetv2(
     return model
 
 
-def efficientnetv2_s(pretrained: bool = False, progress: bool = True):
-    cfg = Config(
-        model=dict(
-            model_name='efficientnetv2_s',
-            blocks_args=BlockDecoder().decode(v2_s_block),
-            width_coefficient=1.0,
-            depth_coefficient=1.0,
-            dropout_rate=0.2,
-        ),
-        train=dict(isize=300, stages=4, sched=True),
-        eval=dict(isize=384),
-        data=dict(augname='randaug', ram=10, mixup_alpha=0, cutmix_alpha=0),
-    )
-    return _efficientnetv2('efficientnetv2_s', cfg, pretrained, progress)
+def efficientnetv2_s(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
+    """
+    Constructs a EfficientNetV2-S architecture from
+    `"EfficientNetV2: Smaller Models and Faster Training" <https://arxiv.org/abs/2104.00298>`_.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    return _efficientnetv2("efficientnetv2_s", 1.0, 1.0, 0.2, pretrained, progress, 's', **kwargs)
 
 
-def efficientnetv2_m(pretrained: bool = False, progress: bool = True):
-    cfg = Config(
-        model=dict(
-            model_name='efficientnetv2_m',
-            blocks_args=BlockDecoder().decode(v2_m_block),
-            width_coefficient=1.0,
-            depth_coefficient=1.0,
-            dropout_rate=0.3,
-        ),
-        train=dict(isize=384, stages=4, sched=True),
-        eval=dict(isize=480),
-        data=dict(augname='randaug', ram=15, mixup_alpha=0.2, cutmix_alpha=0.2),
-    )
-    return _efficientnetv2('efficientnetv2_m', cfg, pretrained, progress)
+def efficientnetv2_m(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
+    """
+    Constructs a EfficientNetV2-M architecture from
+    `"EfficientNetV2: Smaller Models and Faster Training" <https://arxiv.org/abs/2104.00298>`_.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    return _efficientnetv2("efficientnetv2_m", 1.0, 1.1, 0.2, pretrained, progress, 'm', **kwargs)
 
 
-def efficientnetv2_l(pretrained: bool = False, progress: bool = True):
-    cfg = Config(
-        model=dict(
-            model_name='efficientnetv2_l',
-            blocks_args=BlockDecoder().decode(v2_l_block),
-            width_coefficient=1.0,
-            depth_coefficient=1.0,
-            dropout_rate=0.4,
-        ),
-        train=dict(isize=384, stages=4, sched=True),
-        eval=dict(isize=480),
-        data=dict(augname='randaug', ram=20, mixup_alpha=0.5, cutmix_alpha=0.5),
-    )
-    return _efficientnetv2('efficientnetv2_l', cfg, pretrained, progress)
+def efficientnetv2_l(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
+    """
+    Constructs a EfficientNetV2-L architecture from
+    `"EfficientNetV2: Smaller Models and Faster Training" <https://arxiv.org/abs/2104.00298>`_.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    return _efficientnetv2("efficientnetv2_l", 1.1, 1.2, 0.3, pretrained, progress, 'l', **kwargs)
 
 
-def efficientnetv2_xl(pretrained: bool = False, progress: bool = True):
-    cfg = Config(
-        model=dict(
-            model_name='efficientnetv2_xl',
-            blocks_args=BlockDecoder().decode(v2_xl_block),
-            width_coefficient=1.0,
-            depth_coefficient=1.0,
-            dropout_rate=0.4,
-        ),
-        train=dict(isize=384, stages=4, sched=True),
-        eval=dict(isize=512),
-        data=dict(augname='randaug', ram=20, mixup_alpha=0.5, cutmix_alpha=0.5),
-    )
-    return _efficientnetv2('efficientnetv2_xl', cfg, pretrained, progress)
+def efficientnetv2_xl(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
+    """
+    Constructs a EfficientNetV2-XL architecture from
+    `"EfficientNetV2: Smaller Models and Faster Training" <https://arxiv.org/abs/2104.00298>`_.
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    return _efficientnetv2("efficientnetv2_xl", 1.2, 1.4, 0.3, pretrained, progress, 'xl', **kwargs)
 
 
