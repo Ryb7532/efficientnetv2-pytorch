@@ -317,7 +317,7 @@ class EfficientNet(nn.Module):
         layers: List[nn.Module] = []
 
         if activation_layer is None:
-            activation_layer = nn.SiLU
+            activation_layer = partial(nn.SiLU, inplace=True)
 
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -380,7 +380,7 @@ class EfficientNet(nn.Module):
         self.features = nn.Sequential(*layers)
         self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Sequential(
-            nn.Dropout(model_cnf.dropout_rate),
+            nn.Dropout(model_cnf.dropout_rate, inplace=True),
             nn.Linear(lastconv_output_channels, num_classes)
         )
 
@@ -570,12 +570,12 @@ def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mu
     bneck_conf = partial(MBConvConfig, width_mult=width_mult, depth_mult=depth_mult)
     if cnf == 's':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 24, 24, 1, 0),
-            bneck_conf(4, 3, 2, 24, 48, 2, 0),
-            bneck_conf(4, 3, 2, 48, 64, 2, 0),
-            bneck_conf(4, 3, 2, 64, 128, 3, 0.25),
-            bneck_conf(6, 3, 1, 128, 160, 5, 0.25),
-            bneck_conf(6, 3, 2, 160, 256, 8, 0.25),
+            bneck_conf(1, 3, 1, 24, 24, 2, 0),
+            bneck_conf(4, 3, 2, 24, 48, 4, 0),
+            bneck_conf(4, 3, 2, 48, 64, 4, 0),
+            bneck_conf(4, 3, 2, 64, 128, 6, 0.25),
+            bneck_conf(6, 3, 1, 128, 160, 9, 0.25),
+            bneck_conf(6, 3, 2, 160, 256, 15, 0.25),
         ]
     elif cnf == 'm':
         inverted_residual_setting = [
@@ -663,7 +663,7 @@ def efficientnetv2_m(pretrained: bool = False, progress: bool = True, **kwargs: 
         pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnetv2("efficientnetv2_m", 1.0, 1.1, 0.2, pretrained, progress, 'm', **kwargs)
+    return _efficientnetv2("efficientnetv2_m", 1.0, 1.0, 0.3, pretrained, progress, 'm', **kwargs)
 
 
 def efficientnetv2_l(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
@@ -674,7 +674,7 @@ def efficientnetv2_l(pretrained: bool = False, progress: bool = True, **kwargs: 
         pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnetv2("efficientnetv2_l", 1.1, 1.2, 0.3, pretrained, progress, 'l', **kwargs)
+    return _efficientnetv2("efficientnetv2_l", 1.0, 1.0, 0.4, pretrained, progress, 'l', **kwargs)
 
 
 def efficientnetv2_xl(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> EfficientNet:
@@ -685,6 +685,6 @@ def efficientnetv2_xl(pretrained: bool = False, progress: bool = True, **kwargs:
         pretrained (bool): If True, returns a model pre-trained on ImageNet (No suppot yet)
         progress (bool): If True, displays a progress bar of the download to stderr
     """
-    return _efficientnetv2("efficientnetv2_xl", 1.2, 1.4, 0.3, pretrained, progress, 'xl', **kwargs)
+    return _efficientnetv2("efficientnetv2_xl", 1.0, 1.0, 0.4, pretrained, progress, 'xl', **kwargs)
 
 
