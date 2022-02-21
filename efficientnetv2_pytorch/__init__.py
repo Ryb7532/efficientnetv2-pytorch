@@ -15,5 +15,3 @@ from .efficientnetv2 import (
     efficientnetv2_l,
     efficientnetv2_xl
 )
-from .utils import Config
-from .config import BlockDecoder
