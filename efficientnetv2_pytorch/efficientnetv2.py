@@ -102,6 +102,7 @@ class MBConvConfig:
         se_ratio: float,
         width_mult: float,
         depth_mult: float,
+        block_type: int = 0,
     ) -> None:
         self.expand_ratio = expand_ratio
         self.kernel = kernel
@@ -110,7 +111,7 @@ class MBConvConfig:
         self.out_channels = self.adjust_channels(out_channels, width_mult)
         self.num_layers = self.adjust_depth(num_layers, depth_mult)
         self.se_ratio = se_ratio
-        self.block_type = 1 if se_ratio == 0 else 0
+        self.block_type = block_type
 
     def __repr__(self) -> str:
         s = (
@@ -153,72 +154,105 @@ class MBConv(nn.Module):
         self.use_dropout = dropout_rate and cnf.expand_ratio > 1
         self.dropout_rate = dropout_rate
 
-        self._build(cnf, activation_layer, norm_layer, se_layer)
-
-        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
-        self.out_channels = cnf.out_channels
-
-
-    def _build(self,
-        cnf: MBConvConfig,
-        activation_layer: Callable[..., nn.Module],
-        norm_layer: Callable[..., nn.Module],
-        se_layer: Callable[..., nn.Module],
-    ) -> None:
         layers: List[nn.Module] = []
 
-        # expand
-        expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
-        if expanded_channels != cnf.input_channels:
+        if cnf.block_type == 0:
+            # expand
+            expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
+            if expanded_channels != cnf.input_channels:
+                layers.append(
+                    ConvNormActivation(
+                        cnf.input_channels,
+                        expanded_channels,
+                        kernel_size=1,
+                        norm_layer=norm_layer,
+                        activation_layer=activation_layer,
+                    )
+                )
+
+            # depthwise
             layers.append(
                 ConvNormActivation(
-                    cnf.input_channels,
                     expanded_channels,
-                    kernel_size=1,
+                    expanded_channels,
+                    kernel_size=cnf.kernel,
+                    stride=cnf.stride,
+                    groups=expanded_channels,
                     norm_layer=norm_layer,
                     activation_layer=activation_layer,
                 )
             )
 
-        # depthwise
-        layers.append(
-            ConvNormActivation(
-                expanded_channels,
-                expanded_channels,
-                kernel_size=cnf.kernel,
-                stride=cnf.stride,
-                groups=expanded_channels,
-                norm_layer=norm_layer,
-                activation_layer=activation_layer,
-            )
-        )
+            if self.use_dropout:
+                layers.append(nn.Dropout(self.dropout_rate))
 
-        if self.use_dropout:
-            layers.append(nn.Dropout(self.dropout_rate))
+            if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
+                num_reduced_channels = max(
+                    1, int(cnf.input_channels * cnf.se_ratio))
+                layers.append(
+                    se_layer(
+                        expanded_channels,
+                        num_reduced_channels,
+                        activation=activation_layer,
+                    )
+                )
 
-        if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
-            num_reduced_channels = max(
-                1, int(cnf.input_channels * cnf.se_ratio))
+            # project
             layers.append(
-                se_layer(
+                ConvNormActivation(
                     expanded_channels,
-                    num_reduced_channels,
-                    activation=activation_layer,
+                    cnf.out_channels,
+                    kernel_size=1,
+                    norm_layer=norm_layer,
+                    activation_layer=None,
                 )
             )
 
-        # project
-        layers.append(
-            ConvNormActivation(
-                expanded_channels,
-                cnf.out_channels,
-                kernel_size=1,
-                norm_layer=norm_layer,
-                activation_layer=None,
+        else: # FusedMBConv
+            # expand
+            expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
+            if expanded_channels != cnf.input_channels:
+                layers.append(
+                    ConvNormActivation(
+                        cnf.input_channels,
+                        expanded_channels,
+                        kernel_size=cnf.kernel,
+                        stride=cnf.stride,
+                        norm_layer=norm_layer,
+                        activation_layer=activation_layer,
+                    )
+                )
+
+            if self.use_dropout:
+                layers.append(nn.Dropout(self.dropout_rate))
+
+            if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
+                num_reduced_channels = max(
+                    1, int(cnf.input_channels * cnf.se_ratio))
+                layers.append(
+                    se_layer(
+                        expanded_channels,
+                        num_reduced_channels,
+                        activation=activation_layer,
+                    )
+                )
+
+            # project
+            layers.append(
+                ConvNormActivation(
+                    expanded_channels,
+                    cnf.out_channels,
+                    kernel_size=1 if cnf.expand_ratio != 1 else cnf.kernel,
+                    stride=1 if cnf.expand_ratio != 1 else cnf.stride,
+                    norm_layer=norm_layer,
+                    activation_layer=None if cnf.expand_ratio != 1 else activation_layer,
+                )
             )
-        )
 
         self.block = nn.Sequential(*layers)
+        self.stochastic_depth = StochasticDepth(stochastic_depth_prob, "row")
+        self.out_channels = cnf.out_channels
+
 
     def forward(self, input: Tensor) -> Tensor:
         result = self.block(input)
@@ -226,58 +260,6 @@ class MBConv(nn.Module):
             result = self.stochastic_depth(result)
             result += input
         return result
-
-
-class FusedMBConv(MBConv):
-    def _build(self,
-        cnf: MBConvConfig,
-        activation_layer: Callable[..., nn.Module],
-        norm_layer: Callable[..., nn.Module],
-        se_layer: Callable[..., nn.Module],
-    ) -> None:
-        layers: List[nn.Module] = []
-
-        # expand
-        expanded_channels = cnf.adjust_channels(cnf.input_channels, cnf.expand_ratio)
-        if expanded_channels != cnf.input_channels:
-            layers.append(
-                ConvNormActivation(
-                    cnf.input_channels,
-                    expanded_channels,
-                    kernel_size=cnf.kernel,
-                    stride=cnf.stride,
-                    norm_layer=norm_layer,
-                    activation_layer=activation_layer,
-                )
-            )
-
-        if self.use_dropout:
-            layers.append(nn.Dropout(self.dropout_rate))
-
-        if cnf.se_ratio is not None and 0 < cnf.se_ratio <= 1:
-            num_reduced_channels = max(
-                1, int(cnf.input_channels * cnf.se_ratio))
-            layers.append(
-                se_layer(
-                    expanded_channels,
-                    num_reduced_channels,
-                    activation=activation_layer,
-                )
-            )
-
-        # project
-        layers.append(
-            ConvNormActivation(
-                expanded_channels,
-                cnf.out_channels,
-                kernel_size=1 if cnf.expand_ratio != 1 else cnf.kernel,
-                stride=1 if cnf.expand_ratio != 1 else cnf.stride,
-                norm_layer=norm_layer,
-                activation_layer=None if cnf.expand_ratio != 1 else activation_layer,
-            )
-        )
-
-        self.block = nn.Sequential(*layers)
 
 
 
@@ -341,8 +323,6 @@ class EfficientNet(nn.Module):
         for cnf in inverted_residual_setting:
             stage: List[nn.Module] = []
 
-            block = {0: MBConv, 1: FusedMBConv}[cnf.block_type]
-
             for _ in range(cnf.num_layers):
                 # copy to avoid modifications. shallow copy is enough
                 block_cnf = copy.copy(cnf)
@@ -356,7 +336,7 @@ class EfficientNet(nn.Module):
                 sd_prob = model_cnf.stochastic_depth_prob * float(stage_block_id) / total_stage_blocks
 
                 stage.append(
-                    block(
+                    MBConv(
                         block_cnf, sd_prob, model_cnf.conv_dropout, activation_layer, norm_layer
                     )
                 )
@@ -570,18 +550,18 @@ def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mu
     bneck_conf = partial(MBConvConfig, width_mult=width_mult, depth_mult=depth_mult)
     if cnf == 's':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 24, 24, 2, 0),
-            bneck_conf(4, 3, 2, 24, 48, 4, 0),
-            bneck_conf(4, 3, 2, 48, 64, 4, 0),
+            bneck_conf(1, 3, 1, 24, 24, 2, 0, block_type=1),
+            bneck_conf(4, 3, 2, 24, 48, 4, 0, block_type=1),
+            bneck_conf(4, 3, 2, 48, 64, 4, 0, block_type=1),
             bneck_conf(4, 3, 2, 64, 128, 6, 0.25),
             bneck_conf(6, 3, 1, 128, 160, 9, 0.25),
             bneck_conf(6, 3, 2, 160, 256, 15, 0.25),
         ]
     elif cnf == 'm':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 24, 24, 3, 0),
-            bneck_conf(4, 3, 2, 24, 48, 5, 0),
-            bneck_conf(4, 3, 2, 48, 80, 5, 0),
+            bneck_conf(1, 3, 1, 24, 24, 3, 0, block_type=1),
+            bneck_conf(4, 3, 2, 24, 48, 5, 0, block_type=1),
+            bneck_conf(4, 3, 2, 48, 80, 5, 0, block_type=1),
             bneck_conf(4, 3, 2, 80, 160, 7, 0.25),
             bneck_conf(6, 3, 1, 160, 176, 14, 0.25),
             bneck_conf(6, 3, 2, 176, 304, 18, 0.25),
@@ -589,9 +569,9 @@ def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mu
         ]
     elif cnf == 'l':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 32, 32, 4, 0),
-            bneck_conf(4, 3, 2, 32, 64, 7, 0),
-            bneck_conf(4, 3, 2, 64, 96, 7, 0),
+            bneck_conf(1, 3, 1, 32, 32, 4, 0, block_type=1),
+            bneck_conf(4, 3, 2, 32, 64, 7, 0, block_type=1),
+            bneck_conf(4, 3, 2, 64, 96, 7, 0, block_type=1),
             bneck_conf(4, 3, 2, 96, 192, 10, 0.25),
             bneck_conf(6, 3, 1, 192, 224, 19, 0.25),
             bneck_conf(6, 3, 2, 224, 384, 25, 0.25),
@@ -599,9 +579,9 @@ def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mu
         ]
     elif cnf == 'xl':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 32, 32, 4, 0),
-            bneck_conf(4, 3, 2, 32, 64, 8, 0),
-            bneck_conf(4, 3, 2, 64, 96, 8, 0),
+            bneck_conf(1, 3, 1, 32, 32, 4, 0, block_type=1),
+            bneck_conf(4, 3, 2, 32, 64, 8, 0, block_type=1),
+            bneck_conf(4, 3, 2, 64, 96, 8, 0, block_type=1),
             bneck_conf(4, 3, 2, 96, 192, 16, 0.25),
             bneck_conf(6, 3, 1, 192, 256, 24, 0.25),
             bneck_conf(6, 3, 2, 256, 512, 32, 0.25),
@@ -609,9 +589,9 @@ def get_block_configs(cnf: Union[str, MBConvConfig], width_mult: float, depth_mu
         ]
     elif cnf == 'base':
         inverted_residual_setting = [
-            bneck_conf(1, 3, 1, 32, 16, 1, 0),
-            bneck_conf(4, 3, 2, 16, 32, 2, 0),
-            bneck_conf(4, 3, 2, 32, 48, 2, 0),
+            bneck_conf(1, 3, 1, 32, 16, 1, 0, block_type=1),
+            bneck_conf(4, 3, 2, 16, 32, 2, 0, block_type=1),
+            bneck_conf(4, 3, 2, 32, 48, 2, 0, block_type=1),
             bneck_conf(4, 3, 2, 48, 96, 3, 0.25),
             bneck_conf(6, 3, 1, 96, 112, 5, 0.25),
             bneck_conf(6, 3, 2, 112, 192, 8, 0.25),
